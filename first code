@@ -1,0 +1,130 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+
+# Create Synthetic Shoreline Data (Example)
+def generate_synthetic_shoreline_data(n_years=50):
+    np.random.seed(42)
+    years = np.arange(1970, 1970 + n_years)
+    # Assume shoreline position retreats 2 meters per year with some noise
+    position = 1000 - 2 * (years - 1970) + np.random.normal(0, 3, n_years)
+    df = pd.DataFrame({'Year': years, 'Shoreline_Position_m': position})
+    return df
+
+# Custom Dataset
+class ShorelineDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+    
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# RNN Model
+class RNNModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(RNNModel, self).__init__()
+        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+    
+    def forward(self, x):
+        h0 = torch.zeros(self.rnn.num_layers, x.size(0), self.rnn.hidden_size).to(x.device)
+        out, _ = self.rnn(x, h0)
+        out = self.fc(out[:, -1, :])
+        return out
+
+# Prepare Data
+SEQ_LENGTH = 5  # use past 5 years to predict the next
+BATCH_SIZE = 8
+EPOCHS = 100
+HIDDEN_SIZE = 32
+NUM_LAYERS = 1
+LEARNING_RATE = 0.001
+
+# Generate Data
+df = generate_synthetic_shoreline_data()
+
+# Normalize
+scaler = MinMaxScaler()
+position_scaled = scaler.fit_transform(df[['Shoreline_Position_m']])
+
+# Create sequences
+def create_sequences(data, seq_length):
+    xs, ys = [], []
+    for i in range(len(data) - seq_length):
+        x = data[i:i+seq_length]
+        y = data[i+seq_length]
+        xs.append(x)
+        ys.append(y)
+    return np.array(xs), np.array(ys)
+
+X_seq, y_seq = create_sequences(position_scaled, SEQ_LENGTH)
+
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(X_seq, y_seq, test_size=0.2, random_state=42)
+
+# Datasets and Loaders
+train_dataset = ShorelineDataset(X_train, y_train)
+test_dataset = ShorelineDataset(X_test, y_test)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# Model
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = RNNModel(input_size=1, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=1).to(device)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+# Training Loop
+for epoch in range(EPOCHS):
+    model.train()
+    train_loss = 0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        
+        optimizer.zero_grad()
+        output = model(X_batch)
+        loss = criterion(output, y_batch)
+        loss.backward()
+        optimizer.step()
+        
+        train_loss += loss.item()
+    
+    if (epoch+1) % 10 == 0:
+        print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {train_loss/len(train_loader):.4f}")
+
+# Evaluation
+model.eval()
+predictions = []
+true_values = []
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch = X_batch.to(device)
+        outputs = model(X_batch).cpu().numpy()
+        predictions.append(outputs)
+        true_values.append(y_batch.numpy())
+
+predictions = np.vstack(predictions)
+true_values = np.vstack(true_values)
+
+# Inverse scaling
+predictions = scaler.inverse_transform(predictions)
+true_values = scaler.inverse_transform(true_values)
+
+mse = mean_squared_error(true_values, predictions)
+r2 = r2_score(true_values, predictions)
+print(f"Test MSE: {mse:.4f}")
+print(f"Test R² Score: {r2:.4f}")
+
+# Save Model
+torch.save(model.state_dict(), "rnn_shoreline_model.pth")
